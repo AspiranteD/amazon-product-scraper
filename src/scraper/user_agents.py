@@ -1,12 +1,21 @@
 """
-User-agent rotation manager.
+User agent rotation manager.
 
-Loads user agents from a JSON file or uses built-in defaults.
-Tracks usage statistics for analysis.
+Provides random user agent selection with:
+- Default user agents (6 real Chrome/Firefox/Safari strings)
+- External loading from file or any data source
+- Usage tracking per user agent (count + last used timestamp)
+- Fallback to defaults if external source fails
+- Hot-reload capability without restart
+
+In production, user agents are stored in a database with is_active flags.
+This standalone version loads from a JSON file or uses built-in defaults.
 """
 import json
 import logging
 import random
+from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -19,62 +28,93 @@ DEFAULT_USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:121.0) Gecko/20100101 Firefox/121.0",
 ]
 
 
-class UserAgentRotator:
-    """
-    Manages a pool of user-agent strings with random rotation.
+@dataclass
+class UserAgentStats:
+    """Tracks usage of a single user agent string."""
+    user_agent: str
+    usage_count: int = 0
+    last_used_at: Optional[datetime] = None
+    is_active: bool = True
 
-    Can load from a JSON file (list of strings) or use built-in defaults.
-    Tracks how many times each user-agent has been selected.
+
+class UserAgentManager:
+    """
+    Manages user agent rotation with usage tracking.
+
+    Loads user agents from a JSON file or uses built-in defaults.
+    Tracks how many times each UA has been selected and when.
     """
 
-    def __init__(self, source: Optional[str | Path] = None):
-        """
-        Args:
-            source: Path to a JSON file containing a list of user-agent strings.
-                    If None, uses built-in defaults.
-        """
+    def __init__(self, source_path: str | Path | None = None):
+        self._stats: dict[str, UserAgentStats] = {}
         self._agents: list[str] = []
-        self._usage: dict[str, int] = {}
+        self._source_path = Path(source_path) if source_path else None
+        self._load(self._source_path)
 
-        if source:
-            self._load_from_file(Path(source))
-        else:
-            self._agents = list(DEFAULT_USER_AGENTS)
+    def _load(self, path: Optional[Path] = None):
+        """Load user agents from file or use defaults."""
+        agents: list[str] = []
 
-        self._usage = {ua: 0 for ua in self._agents}
-        logger.info("Loaded %d user agents", len(self._agents))
+        if path and path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(data, list):
+                    agents = [str(ua) for ua in data if ua]
+                elif isinstance(data, dict) and "user_agents" in data:
+                    agents = [str(ua) for ua in data["user_agents"] if ua]
+                logger.info("Loaded %d user agents from %s", len(agents), path)
+            except Exception as e:
+                logger.error("Failed to load user agents from %s: %s", path, e)
 
-    def _load_from_file(self, path: Path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, list):
-                self._agents = [str(ua) for ua in data if ua]
-            else:
-                logger.warning("Expected JSON list, got %s. Using defaults.", type(data).__name__)
-                self._agents = list(DEFAULT_USER_AGENTS)
-        except Exception as e:
-            logger.warning("Failed to load user agents from %s: %s. Using defaults.", path, e)
-            self._agents = list(DEFAULT_USER_AGENTS)
+        if not agents:
+            agents = DEFAULT_USER_AGENTS.copy()
+            logger.info("Using %d default user agents", len(agents))
 
-    def get_random(self) -> str:
-        """Return a random user-agent string and track usage."""
-        ua = random.choice(self._agents)
-        self._usage[ua] = self._usage.get(ua, 0) + 1
-        return ua
+        self._agents = agents
+        for ua in agents:
+            if ua not in self._stats:
+                self._stats[ua] = UserAgentStats(user_agent=ua)
+
+    def get_random(self, track_usage: bool = True) -> str:
+        """
+        Return a random user agent string.
+
+        Args:
+            track_usage: If True, increment usage counter and update timestamp.
+        """
+        if not self._agents:
+            return DEFAULT_USER_AGENTS[0]
+
+        selected = random.choice(self._agents)
+
+        if track_usage:
+            stats = self._stats.get(selected)
+            if stats:
+                stats.usage_count += 1
+                stats.last_used_at = datetime.now()
+
+        return selected
 
     def get_all(self) -> list[str]:
-        """Return all available user-agent strings."""
+        """Return a copy of all active user agent strings."""
         return self._agents.copy()
 
-    def get_usage_stats(self) -> dict[str, int]:
-        """Return usage count per user-agent."""
-        return self._usage.copy()
+    def get_stats(self) -> list[UserAgentStats]:
+        """Return usage stats for all user agents."""
+        return list(self._stats.values())
 
-    def __len__(self) -> int:
+    def reload(self):
+        """
+        Reload user agents from the original source.
+
+        Preserves existing usage stats for agents that remain after reload.
+        """
+        logger.info("Reloading user agents...")
+        self._load(self._source_path)
+
+    @property
+    def count(self) -> int:
         return len(self._agents)

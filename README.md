@@ -1,198 +1,189 @@
 # Amazon Product Scraper
 
-**Resilient Amazon product scraper with ASIN lookup, user-agent rotation, and liquidation manifest CSV parser for bulk operations.**
+Production-grade Amazon ES product scraper that extracts titles, prices, images, and features from product pages by ASIN. Built for batch processing thousands of items with a priority queue, dead-product detection, idempotent writes, and user-agent rotation.
 
-![Python](https://img.shields.io/badge/Python-3.11+-blue?logo=python&logoColor=white)
-![BeautifulSoup](https://img.shields.io/badge/BeautifulSoup-4-green)
-![Tests](https://img.shields.io/badge/Tests-pytest-green?logo=pytest&logoColor=white)
-![License](https://img.shields.io/badge/License-MIT-yellow)
-
----
-
-## What it does
-
-Two complementary tools for Amazon product data extraction:
-
-**1. Product Scraper** — Given an ASIN, extracts title, hi-res images, price, and feature bullet points from Amazon product pages. Handles user-agent rotation, HTTP error codes (404, 503), timeouts, and graceful degradation when fields are unavailable.
-
-**2. Manifest Parser** — Parses Amazon liquidation manifest CSVs (from B-Stock, Amazon Warehouse, etc.) with automatic column detection across 35+ naming variations. Extracts batch IDs from filenames, handles type coercion, and processes entire directories.
-
-Built from a production system that scraped **10,000+ products** for a multi-marketplace resale operation.
+Extracted from a real inventory management system that processes truckloads of returned Amazon merchandise.
 
 ## Architecture
 
-```mermaid
-flowchart LR
-    subgraph input [Input Sources]
-        ASIN[ASIN Codes]
-        CSV[Manifest CSVs]
-    end
-
-    subgraph scraper [Product Scraper]
-        UA[User-Agent Rotator]
-        Parser[HTML Parser]
-        Extract[Data Extractor]
-    end
-
-    subgraph manifest [Manifest Parser]
-        Detect[Format Detector]
-        Map[Column Mapper]
-        Parse[Type Parser]
-    end
-
-    subgraph output [Extracted Data]
-        Product[Product Data]
-        Inventory[Inventory Records]
-    end
-
-    ASIN --> UA
-    UA --> Parser
-    Parser --> Extract
-    Extract --> Product
-
-    CSV --> Detect
-    Detect --> Map
-    Map --> Parse
-    Parse --> Inventory
+```
+┌──────────────────────────────────────────────────────────────┐
+│                        CLI Layer                             │
+│  scrape_batch.py (argparse: --limit, --dry-run, --delay,    │
+│                   --batch-id, --price-only, --no-mark-fail)  │
+└──────────────┬───────────────────────────────────────────────┘
+               │
+┌──────────────▼───────────────────────────────────────────────┐
+│                   BatchProcessor                             │
+│  • Orchestrates queue → scrape → apply loop                  │
+│  • Configurable delay between requests                       │
+│  • 404 → mark dead (attempts=99)                             │
+│  • Network error → increment attempts                        │
+│  • Success → idempotent writes (only fill empty fields)      │
+│  • Price None → increment attempts (exists but no price)     │
+│  • Progress callback + batch commit pattern                  │
+└──────┬───────────────────┬───────────────────────────────────┘
+       │                   │
+┌──────▼──────┐    ┌───────▼────────┐
+│ ScrapeQueue │    │ AmazonScraper  │
+│             │    │                │
+│ Priority:   │    │ • GET amazon   │
+│  attempts↑  │    │   .es/dp/ASIN  │
+│  nulls first│    │ • Parse HTML   │
+│             │    │ • Multi-select │
+│ Filters:    │    │   price parse  │
+│  • has ASIN │    │ • Regex hiRes  │
+│  • available│    │   images       │
+│  • < max    │    │ • Dedup images │
+│    attempts │    │ • Fallback     │
+│  • price    │    │   selectors    │
+│    only     │    │ • 404 detect   │
+│  • batch_id │    │ • Timeout 10s  │
+└─────────────┘    └───────┬────────┘
+                           │
+                   ┌───────▼────────┐
+                   │ UserAgent      │
+                   │ Manager        │
+                   │                │
+                   │ • 6 defaults   │
+                   │ • File/DB load │
+                   │ • Random rot.  │
+                   │ • Usage stats  │
+                   │ • Hot reload   │
+                   └────────────────┘
 ```
 
-## Features
+## Key Design Decisions
 
-### Product Scraper
-- **Multi-domain support** — amazon.es, amazon.com, amazon.co.uk, amazon.de, amazon.fr, amazon.it
-- **User-agent rotation** — Pool of 8+ agents with usage tracking, extensible via JSON file
-- **Hi-res image extraction** — Regex on page source for full-resolution images, fallback to landing image
-- **HTTP status tracking** — Every response includes `_status` (200, 404, 503) for upstream retry logic
-- **Graceful degradation** — Missing price, features, or images don't fail the entire scrape
-- **Configurable timeouts** — Per-instance timeout settings
+| Decision | Why |
+|---|---|
+| **Priority queue** (attempts ASC, NULLS FIRST) | Never-scraped items always go first; failed items are retried later with lower priority |
+| **404 dead-marking** (attempts=99) | Products removed from Amazon are permanently excluded without blocking the queue |
+| **Idempotent writes** | Only fill empty fields — re-running is safe, never overwrites existing data |
+| **Multi-selector price parsing** | Amazon uses different container IDs across page layouts; trying 4 selectors covers edge cases |
+| **hiRes regex + landingImage fallback** | The `"hiRes":"url"` pattern in JavaScript gives full-resolution images; `#landingImage` is the fallback for simpler pages |
+| **dict.fromkeys() dedup** | Preserves insertion order while removing duplicate image URLs — cleaner than `set()` |
+| **User-agent rotation** | Reduces detection risk; supports file-based or DB-based loading with graceful fallback |
+| **Price as integer** | Whole euros only (production domain); stripping `.`, `,`, `€` handles locale formatting |
+| **Configurable mark_failures** | Some runs are exploratory — `--no-mark-failures` prevents polluting attempt counts |
 
-### Manifest Parser
-- **Auto-format detection** — Reads CSV headers and maps 35+ column name variations (spaces, underscores, mixed case)
-- **Batch ID extraction** — Parses `A2Z43836` from filenames automatically
-- **Type coercion** — Handles int, float, bool, date with multiple format support
-- **Directory processing** — Parse all CSVs in a folder in one call
-- **Statistics tracking** — Files processed, rows parsed, errors encountered
+## Project Structure
 
-## Quick start
+```
+src/
+  scraper/
+    amazon_scraper.py     # Core scraper: GET + BeautifulSoup parsing
+    user_agents.py        # User agent manager with rotation and stats
+  queue/
+    scrape_queue.py       # Priority queue with filtering and sorting
+  processor/
+    batch_processor.py    # Batch orchestrator with all business logic
+  cli/
+    scrape_batch.py       # CLI entry point with argparse
+data/                     # Input data (JSON files with items)
+tests/                    # 80+ unit tests with mocked HTTP
+examples/
+  scrape_single.py        # Scrape one ASIN
+  batch_scrape.py         # Batch scrape from code
+```
+
+## Installation
 
 ```bash
-git clone https://github.com/AspiranteD/amazon-product-scraper.git
+git clone https://github.com/yourusername/amazon-product-scraper.git
 cd amazon-product-scraper
 pip install -r requirements.txt
 ```
 
-### Scrape a product
-
-```bash
-python examples/scrape_single.py B08N5WRWNW
-python examples/scrape_single.py B08N5WRWNW --domain com
-```
-
-### Parse a manifest
-
-```bash
-python examples/parse_manifest.py path/to/A2Z43836.csv
-python examples/parse_manifest.py path/to/manifests/     # entire directory
-```
-
-### Run tests
-
-```bash
-pytest tests/ -v
-```
-
 ## Usage
 
-### Scraper
+### Single product
+
+```bash
+python examples/scrape_single.py B07GQSS8RH
+```
+
+### Batch CLI
+
+```bash
+# Scrape up to 50 items with 2s delay
+python -m src.cli.scrape_batch --data data/items.json --limit 50
+
+# Dry run (list pending without scraping)
+python -m src.cli.scrape_batch --data data/items.json --dry-run
+
+# Price-only mode for a specific batch
+python -m src.cli.scrape_batch --data data/items.json --price-only --batch-id A2Z48030
+
+# Don't mark failures (exploratory run)
+python -m src.cli.scrape_batch --data data/items.json --no-mark-failures --delay 3.0
+```
+
+### From code
 
 ```python
-from src.scraper import AmazonScraper, UserAgentRotator
+from src.scraper.amazon_scraper import AmazonScraper
+from src.scraper.user_agents import UserAgentManager
+from src.queue.scrape_queue import ScrapeQueue, ScrapeItem
+from src.processor.batch_processor import BatchProcessor, BatchConfig
 
-rotator = UserAgentRotator()
-scraper = AmazonScraper(user_agents=rotator.get_all(), domain="es")
+# Setup
+ua_manager = UserAgentManager()
+scraper = AmazonScraper(ua_manager.get_all())
 
-result = scraper.scrape_product("B08N5WRWNW")
-# {
-#   "_status": 200,
-#   "title": "Sony WH-1000XM4 - Auriculares inalámbricos...",
-#   "images": "https://images-na.ssl.../71abc.jpg|https://...",
-#   "price": 279,
-#   "features": "Cancelación de ruido\n30h de batería\n..."
-# }
+# Build queue
+items = [ScrapeItem(lpn="LPN-001", asin="B07GQSS8RH")]
+queue = ScrapeQueue(items)
 
-if result is None:
-    print("Network error")
-elif result["_status"] == 404:
-    print("Product not found")
-elif result["_status"] == 503:
-    print("Bot detection - retry later")
+# Run batch
+config = BatchConfig(delay=2.0, limit=10)
+processor = BatchProcessor(scraper, queue, config)
+summary = processor.run()
+print(f"OK: {summary['ok']}, FAIL: {summary['fail']}")
 ```
 
-### Manifest parser
+### Input data format
 
-```python
-from src.manifest import ManifestParser
-
-parser = ManifestParser()
-
-# Single file
-rows = parser.parse_file("data/A2Z43836.csv")
-
-# Entire directory
-rows = parser.parse_directory("data/manifests/")
-
-# Work with parsed data
-for row in rows:
-    if row.has_asin():
-        print(f"{row.lpn}: {row.asin} - ${row.retail_value():.2f}")
-
-print(parser.get_stats())
-# {"files_processed": 5, "rows_parsed": 4200, "rows_failed": 3, "files_failed": 0}
+```json
+[
+  {
+    "lpn": "LPN-001",
+    "asin": "B07GQSS8RH",
+    "amazon_description": null,
+    "image_urls": null,
+    "amazon_features": null,
+    "scraped_price": null,
+    "scraping_attempts": 0,
+    "batch_id": "A2Z48030",
+    "available": true
+  }
+]
 ```
 
-## Project structure
+## Running Tests
 
-```
-amazon-product-scraper/
-├── src/
-│   ├── scraper/
-│   │   ├── amazon_scraper.py    # Core ASIN scraper
-│   │   └── user_agents.py       # UA rotation with tracking
-│   └── manifest/
-│       ├── parser.py            # CSV parser with auto-detection
-│       └── models.py            # ManifestRow dataclass
-├── tests/
-│   ├── test_scraper.py          # 9 tests - HTTP mocking
-│   ├── test_manifest_parser.py  # 11 tests - CSV parsing
-│   └── test_user_agents.py      # 6 tests - rotation logic
-├── examples/
-│   ├── scrape_single.py         # CLI: scrape one ASIN
-│   └── parse_manifest.py        # CLI: parse manifest CSVs
-└── requirements.txt
+```bash
+python -m pytest tests/ -v --tb=short
 ```
 
-## Design decisions
+## Tech Stack
 
-**Why HTML scraping instead of Amazon's official SP-API?**
-SP-API requires seller account approval, complex OAuth, and has restrictive rate limits. For a liquidation resale operation processing returned goods, you often don't have SP-API access to the original seller's catalog. HTML scraping with proper rate limiting and user-agent rotation is the pragmatic solution.
+- **Python 3.11+**
+- **requests** — HTTP client with timeout and error handling
+- **BeautifulSoup4** — HTML parsing with CSS selectors
+- **pytest** — Testing framework with mocking
 
-**Why a separate manifest parser?**
-Amazon liquidation manifests come in wildly inconsistent CSV formats — column names change between batches, some use spaces, some underscores, some have extra columns. A robust parser that handles 35+ column variations saves hours of manual data cleaning per truckload.
+## Domain Context
 
-**Why track HTTP status instead of raising exceptions?**
-Upstream callers (batch processors, enrichment pipelines) need to distinguish between "product doesn't exist" (404 — stop retrying), "bot detection" (503 — back off and retry), and "network error" (None — retry immediately). Exceptions lose this nuance.
+This scraper was built for a returns-processing business that receives truckloads of Amazon merchandise. Each item has a unique LPN (License Plate Number) and an ASIN. The scraper enriches inventory records with Amazon product data to enable pricing, cataloging, and resale operations.
 
-## Built with
-
-- **Python 3.11+** — Type hints, dataclasses
-- **requests** — HTTP client with timeout support
-- **BeautifulSoup4** — HTML parsing
-- **pytest** — Unit tests with HTTP mocking
-
-## Part of a larger system
-
-This scraper feeds data into the [AI Product Enrichment Pipeline](https://github.com/AspiranteD/ai-product-enrichment), which categorizes products and generates marketplace-ready listings using OpenAI.
-
-## License
-
-MIT
+Field mapping:
+- `lpn` — unique item identifier in the warehouse
+- `asin` — Amazon Standard Identification Number
+- `amazon_description` — product title from Amazon
+- `amazon_features` — bullet-point features
+- `image_urls` — pipe-separated hi-res image URLs (up to 8)
+- `scraped_price` — integer price in euros
+- `scraping_attempts` — retry counter (99 = dead product)
+- `last_scraped_at` — timestamp of last scrape attempt
+- `batch_id` — truckload identifier for batch filtering

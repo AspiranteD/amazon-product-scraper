@@ -1,4 +1,4 @@
 from .amazon_scraper import AmazonScraper
-from .user_agents import UserAgentRotator
+from .user_agents import UserAgentManager
 
-__all__ = ["AmazonScraper", "UserAgentRotator"]
+__all__ = ["AmazonScraper", "UserAgentManager"]
