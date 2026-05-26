@@ -1,193 +1,192 @@
-"""Tests for ScrapeQueue priority system."""
+"""Tests for ScrapeQueue and ScrapeItem."""
 import pytest
 from datetime import datetime, timedelta
 from src.queue.scrape_queue import ScrapeQueue, ScrapeItem
 
 
 class TestScrapeItemProperties:
-    def test_needs_full_scrape_when_missing_all(self):
-        item = ScrapeItem(asin="B0TEST")
-        assert item.needs_full_scrape is True
+    def test_new_item_is_not_complete(self):
+        item = ScrapeItem(lpn="LPN001", asin="B0TEST")
+        assert item.is_complete is False
 
-    def test_needs_full_scrape_when_missing_price(self):
-        item = ScrapeItem(asin="B0TEST", has_title=True, has_images=True, has_features=True)
-        assert item.needs_full_scrape is True
+    def test_complete_item(self):
+        item = ScrapeItem(
+            lpn="LPN001", asin="B0TEST",
+            amazon_description="Title", image_urls="img.jpg",
+            amazon_features="Feature", scraped_price=99,
+        )
+        assert item.is_complete is True
 
-    def test_complete_item_does_not_need_scrape(self):
-        item = ScrapeItem(asin="B0TEST", has_title=True, has_images=True,
-                         has_price=True, has_features=True)
-        assert item.needs_full_scrape is False
+    def test_has_description(self):
+        assert ScrapeItem(lpn="L", asin="A", amazon_description="T").has_description is True
+        assert ScrapeItem(lpn="L", asin="A", amazon_description="").has_description is False
+        assert ScrapeItem(lpn="L", asin="A").has_description is False
 
-    def test_needs_price_only(self):
-        item = ScrapeItem(asin="B0TEST", has_title=True, has_images=True,
-                         has_price=False, has_features=True)
-        assert item.needs_price_only is True
+    def test_has_price(self):
+        assert ScrapeItem(lpn="L", asin="A", scraped_price=10).has_price is True
+        assert ScrapeItem(lpn="L", asin="A", scraped_price=0).has_price is True
+        assert ScrapeItem(lpn="L", asin="A").has_price is False
 
-    def test_not_price_only_when_missing_title(self):
-        item = ScrapeItem(asin="B0TEST", has_images=True, has_features=True)
-        assert item.needs_price_only is False
+    def test_is_dead_at_99(self):
+        assert ScrapeItem(lpn="L", asin="A", scraping_attempts=99).is_dead is True
+        assert ScrapeItem(lpn="L", asin="A", scraping_attempts=5).is_dead is False
 
-    def test_permanently_failed(self):
-        item = ScrapeItem(asin="B0TEST", scraping_attempts=99)
-        assert item.is_permanently_failed is True
-
-    def test_not_permanently_failed(self):
-        item = ScrapeItem(asin="B0TEST", scraping_attempts=5)
-        assert item.is_permanently_failed is False
-
-    def test_permanently_failed_above_99(self):
-        item = ScrapeItem(asin="B0TEST", scraping_attempts=100)
-        assert item.is_permanently_failed is True
+    def test_missing_fields(self):
+        item = ScrapeItem(lpn="L", asin="A", amazon_description="T")
+        missing = item.missing_fields
+        assert "amazon_description" not in missing
+        assert "image_urls" in missing
+        assert "amazon_features" in missing
+        assert "scraped_price" in missing
 
 
-class TestSortKey:
+class TestScrapeQueueSorting:
     def test_fewer_attempts_first(self):
-        item_0 = ScrapeItem(asin="A", scraping_attempts=0)
-        item_3 = ScrapeItem(asin="B", scraping_attempts=3)
-        assert item_0.sort_key < item_3.sort_key
-
-    def test_never_scraped_before_scraped_same_attempts(self):
-        never = ScrapeItem(asin="A", scraping_attempts=1, last_scraped_at=None)
-        old = ScrapeItem(asin="B", scraping_attempts=1,
-                        last_scraped_at=datetime(2024, 1, 1))
-        assert never.sort_key < old.sort_key
-
-    def test_older_scrape_before_newer_same_attempts(self):
-        old = ScrapeItem(asin="A", scraping_attempts=2,
-                        last_scraped_at=datetime(2024, 1, 1))
-        new = ScrapeItem(asin="B", scraping_attempts=2,
-                        last_scraped_at=datetime(2024, 6, 1))
-        assert old.sort_key < new.sort_key
-
-    def test_attempts_take_priority_over_timestamp(self):
-        low_attempt_recent = ScrapeItem(asin="A", scraping_attempts=1,
-                                       last_scraped_at=datetime(2024, 12, 1))
-        high_attempt_old = ScrapeItem(asin="B", scraping_attempts=5,
-                                     last_scraped_at=datetime(2020, 1, 1))
-        assert low_attempt_recent.sort_key < high_attempt_old.sort_key
-
-
-class TestQueueBuild:
-    def _make_items(self):
-        now = datetime.now()
-        return [
-            ScrapeItem(asin="FRESH", scraping_attempts=0),
-            ScrapeItem(asin="RETRY1", scraping_attempts=2,
-                      last_scraped_at=now - timedelta(hours=5)),
-            ScrapeItem(asin="RETRY2", scraping_attempts=2,
-                      last_scraped_at=now - timedelta(hours=1)),
-            ScrapeItem(asin="FAILED404", scraping_attempts=99),
-            ScrapeItem(asin="COMPLETE", has_title=True, has_images=True,
-                      has_price=True, has_features=True),
-            ScrapeItem(asin="PRICE_ONLY", has_title=True, has_images=True,
-                      has_features=True, scraping_attempts=1),
+        items = [
+            ScrapeItem(lpn="L2", asin="A2", scraping_attempts=3),
+            ScrapeItem(lpn="L1", asin="A1", scraping_attempts=0),
         ]
-
-    def test_excludes_permanently_failed(self):
-        items = self._make_items()
         queue = ScrapeQueue(items)
-        result = queue.build()
-        asins = [i.asin for i in result]
-        assert "FAILED404" not in asins
+        result = queue.get_pending()
+        assert result[0].lpn == "L1"
 
+    def test_nulls_first_on_last_scraped(self):
+        items = [
+            ScrapeItem(lpn="L1", asin="A1", scraping_attempts=1,
+                      last_scraped_at=datetime(2024, 1, 1)),
+            ScrapeItem(lpn="L2", asin="A2", scraping_attempts=1,
+                      last_scraped_at=None),
+        ]
+        queue = ScrapeQueue(items)
+        result = queue.get_pending()
+        assert result[0].lpn == "L2"
+
+    def test_older_scrape_before_newer(self):
+        items = [
+            ScrapeItem(lpn="L2", asin="A2", scraping_attempts=2,
+                      last_scraped_at=datetime(2024, 6, 1)),
+            ScrapeItem(lpn="L1", asin="A1", scraping_attempts=2,
+                      last_scraped_at=datetime(2024, 1, 1)),
+        ]
+        queue = ScrapeQueue(items)
+        result = queue.get_pending()
+        assert result[0].lpn == "L1"
+
+
+class TestScrapeQueueFiltering:
     def test_excludes_complete_items(self):
-        items = self._make_items()
+        items = [
+            ScrapeItem(lpn="L1", asin="A1"),
+            ScrapeItem(lpn="L2", asin="A2", amazon_description="T",
+                      image_urls="i", amazon_features="f", scraped_price=10),
+        ]
         queue = ScrapeQueue(items)
-        result = queue.build()
-        asins = [i.asin for i in result]
-        assert "COMPLETE" not in asins
-
-    def test_priority_order(self):
-        items = self._make_items()
-        queue = ScrapeQueue(items)
-        result = queue.build()
-        asins = [i.asin for i in result]
-        assert asins[0] == "FRESH"
-        assert asins.index("RETRY1") < asins.index("RETRY2")
-
-    def test_limit(self):
-        items = self._make_items()
-        queue = ScrapeQueue(items)
-        result = queue.build(limit=2)
-        assert len(result) == 2
-
-    def test_price_only_filter(self):
-        items = self._make_items()
-        queue = ScrapeQueue(items, price_only=True)
-        result = queue.build()
+        result = queue.get_pending()
         assert len(result) == 1
-        assert result[0].asin == "PRICE_ONLY"
+        assert result[0].lpn == "L1"
 
-    def test_a2z_filter(self):
+    def test_excludes_over_max_attempts(self):
         items = [
-            ScrapeItem(asin="A1", id_a2z="A2Z001"),
-            ScrapeItem(asin="A2", id_a2z="A2Z002"),
-            ScrapeItem(asin="A3", id_a2z="A2Z001"),
-            ScrapeItem(asin="A4"),
-        ]
-        queue = ScrapeQueue(items, filter_a2z=["A2Z001"])
-        result = queue.build()
-        asins = [i.asin for i in result]
-        assert set(asins) == {"A1", "A3"}
-
-    def test_a2z_filter_multiple_codes(self):
-        items = [
-            ScrapeItem(asin="A1", id_a2z="A2Z001"),
-            ScrapeItem(asin="A2", id_a2z="A2Z002"),
-            ScrapeItem(asin="A3", id_a2z="A2Z003"),
-        ]
-        queue = ScrapeQueue(items, filter_a2z=["A2Z001", "A2Z003"])
-        result = queue.build()
-        asins = [i.asin for i in result]
-        assert set(asins) == {"A1", "A3"}
-
-    def test_max_attempts_filter(self):
-        items = [
-            ScrapeItem(asin="OK", scraping_attempts=5),
-            ScrapeItem(asin="TOOMANY", scraping_attempts=50),
+            ScrapeItem(lpn="L1", asin="A1", scraping_attempts=5),
+            ScrapeItem(lpn="L2", asin="A2", scraping_attempts=15),
         ]
         queue = ScrapeQueue(items, max_attempts=10)
-        result = queue.build()
-        asins = [i.asin for i in result]
-        assert "OK" in asins
-        assert "TOOMANY" not in asins
+        result = queue.get_pending()
+        assert len(result) == 1
+        assert result[0].lpn == "L1"
 
-    def test_empty_items(self):
+    def test_excludes_empty_asin(self):
+        items = [
+            ScrapeItem(lpn="L1", asin=""),
+            ScrapeItem(lpn="L2", asin="B0OK"),
+        ]
+        queue = ScrapeQueue(items)
+        result = queue.get_pending()
+        assert len(result) == 1
+
+    def test_excludes_unavailable(self):
+        items = [
+            ScrapeItem(lpn="L1", asin="A1", available=False),
+            ScrapeItem(lpn="L2", asin="A2", available=True),
+        ]
+        queue = ScrapeQueue(items)
+        result = queue.get_pending()
+        assert len(result) == 1
+        assert result[0].lpn == "L2"
+
+    def test_price_only_mode(self):
+        items = [
+            ScrapeItem(lpn="L1", asin="A1", scraped_price=50),
+            ScrapeItem(lpn="L2", asin="A2", scraped_price=None),
+            ScrapeItem(lpn="L3", asin="A3"),
+        ]
+        queue = ScrapeQueue(items)
+        result = queue.get_pending(price_only=True)
+        lpns = [i.lpn for i in result]
+        assert "L1" not in lpns
+        assert "L2" in lpns
+        assert "L3" in lpns
+
+    def test_batch_id_filter(self):
+        items = [
+            ScrapeItem(lpn="L1", asin="A1", batch_id="A2Z001"),
+            ScrapeItem(lpn="L2", asin="A2", batch_id="A2Z002"),
+            ScrapeItem(lpn="L3", asin="A3", batch_id="A2Z001"),
+        ]
+        queue = ScrapeQueue(items)
+        result = queue.get_pending(batch_id="A2Z001")
+        assert len(result) == 2
+        assert all(i.batch_id == "A2Z001" for i in result)
+
+    def test_skip_attempt_limit(self):
+        items = [
+            ScrapeItem(lpn="L1", asin="A1", scraping_attempts=50),
+        ]
+        queue = ScrapeQueue(items, max_attempts=10)
+        assert len(queue.get_pending()) == 0
+        assert len(queue.get_pending(skip_attempt_limit=True)) == 1
+
+    def test_limit(self):
+        items = [ScrapeItem(lpn=f"L{i}", asin=f"A{i}") for i in range(20)]
+        queue = ScrapeQueue(items)
+        result = queue.get_pending(limit=5)
+        assert len(result) == 5
+
+    def test_empty_queue(self):
         queue = ScrapeQueue([])
-        result = queue.build()
-        assert result == []
+        assert queue.get_pending() == []
 
-    def test_all_complete_returns_empty(self):
+
+class TestScrapeQueueStats:
+    def test_stats(self):
         items = [
-            ScrapeItem(asin="A", has_title=True, has_images=True,
-                      has_price=True, has_features=True),
+            ScrapeItem(lpn="L1", asin="A1"),
+            ScrapeItem(lpn="L2", asin="A2", scraping_attempts=99),
+            ScrapeItem(lpn="L3", asin="A3", amazon_description="T",
+                      image_urls="i", amazon_features="f", scraped_price=10),
+            ScrapeItem(lpn="L4", asin="A4", available=False),
         ]
         queue = ScrapeQueue(items)
-        result = queue.build()
-        assert result == []
+        stats = queue.get_stats()
+        assert stats["total"] == 4
+        assert stats["dead"] == 1
+        assert stats["complete"] == 1
 
 
-class TestQueueStats:
-    def test_stats_counts(self):
-        items = [
-            ScrapeItem(asin="A"),
-            ScrapeItem(asin="B", scraping_attempts=99),
-            ScrapeItem(asin="C", has_title=True, has_images=True, has_features=True),
-            ScrapeItem(asin="D", has_title=True, has_images=True,
-                      has_price=True, has_features=True),
-        ]
-        queue = ScrapeQueue(items)
-        stats = queue.stats()
-        assert stats["total_items"] == 4
-        assert stats["permanently_failed_404"] == 1
-        assert stats["need_price_only"] == 1
+class TestScrapeQueueCRUD:
+    def test_add_items(self):
+        queue = ScrapeQueue([])
+        queue.add_items([ScrapeItem(lpn="L1", asin="A1")])
+        assert len(queue) == 1
 
-    def test_never_scraped_count(self):
-        items = [
-            ScrapeItem(asin="A"),
-            ScrapeItem(asin="B", last_scraped_at=datetime.now()),
-            ScrapeItem(asin="C", scraping_attempts=99),
-        ]
-        queue = ScrapeQueue(items)
-        stats = queue.stats()
-        assert stats["never_scraped"] == 1
+    def test_remove_item(self):
+        queue = ScrapeQueue([ScrapeItem(lpn="L1", asin="A1")])
+        assert queue.remove_item("L1") is True
+        assert len(queue) == 0
+        assert queue.remove_item("NONEXIST") is False
+
+    def test_get_item(self):
+        item = ScrapeItem(lpn="L1", asin="A1")
+        queue = ScrapeQueue([item])
+        assert queue.get_item("L1") is item
+        assert queue.get_item("NONEXIST") is None

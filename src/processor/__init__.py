@@ -1,3 +1,3 @@
-from .batch_processor import BatchProcessor, BatchConfig
+from .batch_processor import BatchProcessor, ScrapeResult
 
-__all__ = ["BatchProcessor", "BatchConfig"]
+__all__ = ["BatchProcessor", "ScrapeResult"]

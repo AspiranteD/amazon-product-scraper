@@ -1,7 +1,6 @@
 """Tests for UserAgentManager."""
 import json
 import pytest
-from pathlib import Path
 from src.scraper.user_agents import UserAgentManager, DEFAULT_USER_AGENTS
 
 
@@ -21,7 +20,6 @@ class TestFileLoading:
         agents = ["Agent/1.0", "Agent/2.0", "Agent/3.0"]
         path = tmp_path / "agents.json"
         path.write_text(json.dumps(agents))
-
         manager = UserAgentManager(source_path=path)
         assert manager.count == 3
         assert manager.get_all() == agents
@@ -30,29 +28,24 @@ class TestFileLoading:
         data = {"user_agents": ["DictAgent/1.0", "DictAgent/2.0"]}
         path = tmp_path / "agents.json"
         path.write_text(json.dumps(data))
-
         manager = UserAgentManager(source_path=path)
         assert manager.count == 2
 
-    def test_invalid_json_falls_back_to_defaults(self, tmp_path):
+    def test_invalid_json_falls_back(self, tmp_path):
         path = tmp_path / "bad.json"
-        path.write_text("not json {{{")
-
+        path.write_text("not json")
         manager = UserAgentManager(source_path=path)
         assert manager.count == len(DEFAULT_USER_AGENTS)
 
-    def test_empty_list_falls_back_to_defaults(self, tmp_path):
+    def test_empty_list_falls_back(self, tmp_path):
         path = tmp_path / "empty.json"
         path.write_text("[]")
-
         manager = UserAgentManager(source_path=path)
         assert manager.count == len(DEFAULT_USER_AGENTS)
 
     def test_filters_empty_strings(self, tmp_path):
-        agents = ["Agent/1.0", "", None, "Agent/2.0"]
         path = tmp_path / "agents.json"
-        path.write_text(json.dumps(agents))
-
+        path.write_text(json.dumps(["Agent/1.0", "", None, "Agent/2.0"]))
         manager = UserAgentManager(source_path=path)
         assert manager.count == 2
 
@@ -74,10 +67,10 @@ class TestRandomSelection:
     def test_no_tracking_when_disabled(self):
         manager = UserAgentManager()
         manager.get_random(track_usage=False)
-        total_usage = sum(s.usage_count for s in manager.get_stats())
-        assert total_usage == 0
+        total = sum(s.usage_count for s in manager.get_stats())
+        assert total == 0
 
-    def test_multiple_calls_distribute(self):
+    def test_distributes_across_agents(self):
         manager = UserAgentManager()
         for _ in range(100):
             manager.get_random()
@@ -90,26 +83,20 @@ class TestReload:
         agents = ["Agent/1.0", "Agent/2.0"]
         path = tmp_path / "agents.json"
         path.write_text(json.dumps(agents))
-
         manager = UserAgentManager(source_path=path)
-
         for _ in range(5):
             manager.get_random()
-        stats_before = {s.user_agent: s.usage_count for s in manager.get_stats()}
-
+        before = {s.user_agent: s.usage_count for s in manager.get_stats()}
         manager.reload()
-        stats_after = {s.user_agent: s.usage_count for s in manager.get_stats()}
-
+        after = {s.user_agent: s.usage_count for s in manager.get_stats()}
         for ua in agents:
-            assert stats_after[ua] == stats_before[ua]
+            assert after[ua] == before[ua]
 
     def test_reload_picks_up_new_agents(self, tmp_path):
         path = tmp_path / "agents.json"
         path.write_text(json.dumps(["Agent/1.0"]))
-
         manager = UserAgentManager(source_path=path)
         assert manager.count == 1
-
         path.write_text(json.dumps(["Agent/1.0", "Agent/2.0", "Agent/3.0"]))
         manager.reload()
         assert manager.count == 3

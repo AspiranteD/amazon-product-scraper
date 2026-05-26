@@ -1,189 +1,139 @@
 # Amazon Product Scraper
 
-Production-grade Amazon ES product scraper that extracts titles, prices, images, and features from product pages by ASIN. Built for batch processing thousands of items with a priority queue, dead-product detection, idempotent writes, and user-agent rotation.
-
-Extracted from a real inventory management system that processes truckloads of returned Amazon merchandise.
+Production-grade web scraper for Amazon ES (amazon.es) product pages. Designed for high-volume batch scraping of thousands of ASINs with built-in resilience, priority queuing, idempotent writes, and anti-rate-limiting.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────────┐
-│                        CLI Layer                             │
-│  scrape_batch.py (argparse: --limit, --dry-run, --delay,    │
-│                   --batch-id, --price-only, --no-mark-fail)  │
-└──────────────┬───────────────────────────────────────────────┘
-               │
-┌──────────────▼───────────────────────────────────────────────┐
-│                   BatchProcessor                             │
-│  • Orchestrates queue → scrape → apply loop                  │
-│  • Configurable delay between requests                       │
-│  • 404 → mark dead (attempts=99)                             │
-│  • Network error → increment attempts                        │
-│  • Success → idempotent writes (only fill empty fields)      │
-│  • Price None → increment attempts (exists but no price)     │
-│  • Progress callback + batch commit pattern                  │
-└──────┬───────────────────┬───────────────────────────────────┘
-       │                   │
-┌──────▼──────┐    ┌───────▼────────┐
-│ ScrapeQueue │    │ AmazonScraper  │
-│             │    │                │
-│ Priority:   │    │ • GET amazon   │
-│  attempts↑  │    │   .es/dp/ASIN  │
-│  nulls first│    │ • Parse HTML   │
-│             │    │ • Multi-select │
-│ Filters:    │    │   price parse  │
-│  • has ASIN │    │ • Regex hiRes  │
-│  • available│    │   images       │
-│  • < max    │    │ • Dedup images │
-│    attempts │    │ • Fallback     │
-│  • price    │    │   selectors    │
-│    only     │    │ • 404 detect   │
-│  • batch_id │    │ • Timeout 10s  │
-└─────────────┘    └───────┬────────┘
-                           │
-                   ┌───────▼────────┐
-                   │ UserAgent      │
-                   │ Manager        │
-                   │                │
-                   │ • 6 defaults   │
-                   │ • File/DB load │
-                   │ • Random rot.  │
-                   │ • Usage stats  │
-                   │ • Hot reload   │
-                   └────────────────┘
-```
-
-## Key Design Decisions
-
-| Decision | Why |
-|---|---|
-| **Priority queue** (attempts ASC, NULLS FIRST) | Never-scraped items always go first; failed items are retried later with lower priority |
-| **404 dead-marking** (attempts=99) | Products removed from Amazon are permanently excluded without blocking the queue |
-| **Idempotent writes** | Only fill empty fields — re-running is safe, never overwrites existing data |
-| **Multi-selector price parsing** | Amazon uses different container IDs across page layouts; trying 4 selectors covers edge cases |
-| **hiRes regex + landingImage fallback** | The `"hiRes":"url"` pattern in JavaScript gives full-resolution images; `#landingImage` is the fallback for simpler pages |
-| **dict.fromkeys() dedup** | Preserves insertion order while removing duplicate image URLs — cleaner than `set()` |
-| **User-agent rotation** | Reduces detection risk; supports file-based or DB-based loading with graceful fallback |
-| **Price as integer** | Whole euros only (production domain); stripping `.`, `,`, `€` handles locale formatting |
-| **Configurable mark_failures** | Some runs are exploratory — `--no-mark-failures` prevents polluting attempt counts |
-
-## Project Structure
-
-```
 src/
-  scraper/
-    amazon_scraper.py     # Core scraper: GET + BeautifulSoup parsing
-    user_agents.py        # User agent manager with rotation and stats
-  queue/
-    scrape_queue.py       # Priority queue with filtering and sorting
-  processor/
-    batch_processor.py    # Batch orchestrator with all business logic
-  cli/
-    scrape_batch.py       # CLI entry point with argparse
-data/                     # Input data (JSON files with items)
-tests/                    # 80+ unit tests with mocked HTTP
-examples/
-  scrape_single.py        # Scrape one ASIN
-  batch_scrape.py         # Batch scrape from code
+├── scraper/
+│   ├── amazon_scraper.py     # Core scraper: title, images, price, features extraction
+│   └── user_agents.py        # UA rotation with usage tracking and hot-reload
+├── queue/
+│   └── scrape_queue.py       # Priority queue with real field names (lpn, asin, etc.)
+├── processor/
+│   └── batch_processor.py    # Orchestrates batch scraping with idempotent writes
+├── cli/
+│   └── scrape_batch.py       # CLI entry point with full argument parsing
+└── examples/
+    ├── scrape_single.py      # Single ASIN scrape demo
+    └── batch_scrape.py       # Full pipeline demo with queue + processor
 ```
 
-## Installation
+## Key Technical Features
 
-```bash
-git clone https://github.com/yourusername/amazon-product-scraper.git
-cd amazon-product-scraper
-pip install -r requirements.txt
-```
+### Multi-Selector Price Parsing
+Amazon A/B tests different price display components. The scraper tries four container selectors in sequence (`corePriceDisplay_desktop_feature_div`, `corePrice_feature_div`) to handle all variants. Prices are parsed as integer euros from `.a-price-whole` spans, stripping dots, commas, and euro signs.
+
+### High-Resolution Image Extraction
+Primary extraction uses regex to find `"hiRes":"<url>"` patterns in the raw page source (Amazon embeds image gallery data in inline scripts). Falls back to `#landingImage` src attribute. Images are deduplicated via `dict.fromkeys()` and capped at 8.
+
+### Priority Queue System
+`ScrapeQueue` implements production-level prioritization using real database field names:
+- **Sort**: `(scraping_attempts ASC, last_scraped_at ASC NULLS FIRST)` — fresh items first, then oldest retries
+- **Filters**: by `available` status, `batch_id` (truckload codes), `price_only` mode, `max_attempts` threshold, `skip_attempt_limit`
+- **Dead marking**: items with `attempts=99` are permanently excluded (confirmed 404s)
+- **Field tracking**: `has_description`, `has_images`, `has_features`, `has_price`, `is_complete`, `missing_fields`
+
+### Idempotent Writes
+The `BatchProcessor` implements the critical production pattern of **never overwriting existing data**:
+- Only sets `amazon_description` if currently empty
+- Only sets `image_urls` if currently empty
+- Only sets `scraped_price` if currently `None`
+- Only sets `amazon_features` if currently empty
+
+This prevents accidental overwrites of manually corrected data.
+
+### Intelligent Retry Logic
+- **200 with price**: full success, no attempt increment
+- **200 without price**: data saved but **attempts incremented** — item retried with lower priority
+- **404**: permanently marked with `attempts=99`, never retried
+- **Network error**: attempts incremented (or not, via `mark_failures` flag)
+
+### `--no-mark-failures` Mode
+Production flag that prevents incrementing `scraping_attempts` on errors. Useful for test runs or when scraping infrastructure issues are expected — items stay at original priority for the next real run.
+
+### User Agent Rotation
+- 6 built-in real Chrome/Firefox/Safari user agents
+- External loading from JSON file
+- Per-agent usage tracking (count + timestamp)
+- Hot-reload without restart
+- Graceful fallback on errors
+
+### Batch Processing
+- Configurable delay between requests (anti-rate-limiting)
+- Commit batching: persistence callback every N items
+- Database-agnostic callbacks: `on_result(asin, data, meta)` and `on_commit()`
+- Price-only mode for targeted re-scraping
+- Dry-run mode
 
 ## Usage
 
-### Single product
-
-```bash
-python examples/scrape_single.py B07GQSS8RH
-```
-
-### Batch CLI
-
-```bash
-# Scrape up to 50 items with 2s delay
-python -m src.cli.scrape_batch --data data/items.json --limit 50
-
-# Dry run (list pending without scraping)
-python -m src.cli.scrape_batch --data data/items.json --dry-run
-
-# Price-only mode for a specific batch
-python -m src.cli.scrape_batch --data data/items.json --price-only --batch-id A2Z48030
-
-# Don't mark failures (exploratory run)
-python -m src.cli.scrape_batch --data data/items.json --no-mark-failures --delay 3.0
-```
-
-### From code
-
+### Single Product
 ```python
-from src.scraper.amazon_scraper import AmazonScraper
-from src.scraper.user_agents import UserAgentManager
-from src.queue.scrape_queue import ScrapeQueue, ScrapeItem
-from src.processor.batch_processor import BatchProcessor, BatchConfig
+from src.scraper import AmazonScraper, UserAgentManager
 
-# Setup
-ua_manager = UserAgentManager()
-scraper = AmazonScraper(ua_manager.get_all())
-
-# Build queue
-items = [ScrapeItem(lpn="LPN-001", asin="B07GQSS8RH")]
-queue = ScrapeQueue(items)
-
-# Run batch
-config = BatchConfig(delay=2.0, limit=10)
-processor = BatchProcessor(scraper, queue, config)
-summary = processor.run()
-print(f"OK: {summary['ok']}, FAIL: {summary['fail']}")
+ua = UserAgentManager()
+scraper = AmazonScraper(user_agents=ua.get_all())
+result = scraper.scrape_product("B09V3KXJPB")
 ```
 
-### Input data format
+### Batch with Priority Queue
+```python
+from src.queue import ScrapeQueue, ScrapeItem
+from src.processor import BatchProcessor
 
-```json
-[
-  {
-    "lpn": "LPN-001",
-    "asin": "B07GQSS8RH",
-    "amazon_description": null,
-    "image_urls": null,
-    "amazon_features": null,
-    "scraped_price": null,
-    "scraping_attempts": 0,
-    "batch_id": "A2Z48030",
-    "available": true
-  }
-]
+items = [ScrapeItem(lpn="LPN001", asin="B0ABC"), ...]
+queue = ScrapeQueue(items, max_attempts=10)
+pending = queue.get_pending(limit=100, price_only=True)
+
+processor = BatchProcessor(
+    scraper=scraper,
+    on_result=lambda asin, data, meta: db.update(asin, data, meta),
+    on_commit=lambda: db.commit(),
+    delay_seconds=3.0,
+    mark_failures=True,
+)
+
+result = processor.process([
+    {"asin": item.asin, "scraping_attempts": item.scraping_attempts,
+     "amazon_description": item.amazon_description,
+     "scraped_price": item.scraped_price}
+    for item in pending
+])
 ```
 
-## Running Tests
+### CLI
+```bash
+python -m src.cli.scrape_batch --limit 50 --delay 3
+python -m src.cli.scrape_batch --a2z A2Z33838,A2Z33839 --limit 100
+python -m src.cli.scrape_batch --price-only --limit 200
+python -m src.cli.scrape_batch --dry-run
+```
+
+## Setup
 
 ```bash
-python -m pytest tests/ -v --tb=short
+pip install -r requirements.txt
 ```
 
-## Tech Stack
+## Tests
 
-- **Python 3.11+**
-- **requests** — HTTP client with timeout and error handling
-- **BeautifulSoup4** — HTML parsing with CSS selectors
-- **pytest** — Testing framework with mocking
+```bash
+python -m pytest tests/ -v
+```
 
-## Domain Context
+74 tests covering: scraper parsing, image dedup, price selectors, queue sorting/filtering, idempotent writes, mark_failures flag, batch processing, mixed scenarios.
 
-This scraper was built for a returns-processing business that receives truckloads of Amazon merchandise. Each item has a unique LPN (License Plate Number) and an ASIN. The scraper enriches inventory records with Amazon product data to enable pricing, cataloging, and resale operations.
+## Technical Decisions
 
-Field mapping:
-- `lpn` — unique item identifier in the warehouse
-- `asin` — Amazon Standard Identification Number
-- `amazon_description` — product title from Amazon
-- `amazon_features` — bullet-point features
-- `image_urls` — pipe-separated hi-res image URLs (up to 8)
-- `scraped_price` — integer price in euros
-- `scraping_attempts` — retry counter (99 = dead product)
-- `last_scraped_at` — timestamp of last scrape attempt
-- `batch_id` — truckload identifier for batch filtering
+| Decision | Rationale |
+|----------|-----------|
+| Integer prices (no decimals) | Amazon ES products in this domain are whole-euro; simplifies downstream |
+| `attempts=99` for 404 | Convention: distinguishes confirmed-gone products from retry-eligible failures |
+| Regex for hiRes images | More reliable than DOM — Amazon embeds gallery JSON in script tags |
+| 8 image limit | Target marketplace (Wallapop) listing maximum |
+| Idempotent writes | Never overwrite manually corrected data in production |
+| `mark_failures` flag | Test runs shouldn't penalize items for infrastructure issues |
+| `dict.fromkeys()` dedup | Preserves insertion order (Python 3.7+) while removing duplicates |
+| Callback-based persistence | Keeps scraper database-agnostic; caller controls storage |
