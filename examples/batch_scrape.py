@@ -1,9 +1,11 @@
 """
-Example: Batch scrape multiple products from a JSON file.
+Example: Batch scrape multiple products using the full pipeline.
+
+Demonstrates the priority queue + batch processor + idempotent writes
+pattern from the production system.
 
 Usage:
     python examples/batch_scrape.py
-    python examples/batch_scrape.py --data data/sample_items.json --limit 5
     python examples/batch_scrape.py --dry-run
 """
 import json
@@ -15,18 +17,18 @@ sys.path.insert(0, ".")
 from src.scraper.amazon_scraper import AmazonScraper
 from src.scraper.user_agents import UserAgentManager
 from src.queue.scrape_queue import ScrapeQueue, ScrapeItem
-from src.processor.batch_processor import BatchProcessor, BatchConfig, ProcessResult
+from src.processor.batch_processor import BatchProcessor
 
 SAMPLE_ITEMS = [
-    {"lpn": "LPN-001", "asin": "B07GQSS8RH"},
-    {"lpn": "LPN-002", "asin": "B0BN8Y5GNK"},
-    {"lpn": "LPN-003", "asin": "B09V3KXJPB"},
+    ScrapeItem(lpn="LPN-001", asin="B07GQSS8RH"),
+    ScrapeItem(lpn="LPN-002", asin="B0BN8Y5GNK"),
+    ScrapeItem(lpn="LPN-003", asin="B09V3KXJPB", scraping_attempts=2),
+    ScrapeItem(
+        lpn="LPN-004", asin="B08N5WRWNW",
+        amazon_description="Already has title",
+        image_urls="existing.jpg",
+    ),
 ]
-
-
-def progress_callback(current: int, total: int, result: ProcessResult):
-    icon = "OK" if result.success else "FAIL"
-    print(f"  [{current}/{total}] {icon} {result.lpn} -> {result.status}")
 
 
 def main():
@@ -35,41 +37,64 @@ def main():
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
 
-    items = [
-        ScrapeItem(lpn=row["lpn"], asin=row["asin"])
-        for row in SAMPLE_ITEMS
-    ]
+    dry_run = "--dry-run" in sys.argv
+
+    queue = ScrapeQueue(SAMPLE_ITEMS, max_attempts=10)
+    print(f"\nQueue stats: {json.dumps(queue.get_stats(), indent=2)}")
+
+    pending = queue.get_pending(limit=10)
+    print(f"Pending items: {len(pending)}")
+
+    if dry_run:
+        for i, item in enumerate(pending, 1):
+            print(f"  [{i}] LPN={item.lpn} ASIN={item.asin} "
+                  f"attempts={item.scraping_attempts} missing={item.missing_fields}")
+        print("DRY RUN - no scraping performed")
+        return
 
     ua_manager = UserAgentManager()
     scraper = AmazonScraper(ua_manager.get_all())
-    queue = ScrapeQueue(items)
 
-    config = BatchConfig(
-        delay=2.0,
-        dry_run="--dry-run" in sys.argv,
-        limit=int(sys.argv[sys.argv.index("--limit") + 1]) if "--limit" in sys.argv else None,
-    )
+    results_db: dict[str, dict] = {}
+
+    def on_result(asin: str, data: dict, meta: dict):
+        results_db[asin] = {"data": data, "meta": meta}
+        status = meta.get("status", "unknown")
+        fields = meta.get("fields_updated", [])
+        print(f"  -> {asin}: {status} (fields: {fields})")
+
+    commit_count = [0]
+    def on_commit():
+        commit_count[0] += 1
 
     processor = BatchProcessor(
         scraper=scraper,
-        queue=queue,
-        config=config,
-        on_progress=progress_callback,
+        on_result=on_result,
+        on_commit=on_commit,
+        delay_seconds=3.0,
+        commit_batch_size=5,
+        mark_failures=True,
     )
 
-    print(f"\nBatch scraping {len(items)} items")
-    print(f"Queue stats: {queue.get_stats()}")
+    item_dicts = [
+        {
+            "asin": item.asin,
+            "scraping_attempts": item.scraping_attempts,
+            "amazon_description": item.amazon_description,
+            "image_urls": item.image_urls,
+            "scraped_price": item.scraped_price,
+            "amazon_features": item.amazon_features,
+        }
+        for item in pending
+    ]
+
+    print(f"\nScraping {len(item_dicts)} items...")
     print("-" * 40)
+    result = processor.process(item_dicts)
 
-    summary = processor.run()
-
-    if not config.dry_run:
-        print(f"\nResults: {summary['ok']} OK / {summary['fail']} FAIL / {summary['total']} total")
-
-    print("\nUpdated items:")
-    for item in items:
-        if item.scraped_price is not None or item.amazon_description:
-            print(f"  {item.lpn}: price={item.scraped_price}, desc={item.amazon_description[:50] if item.amazon_description else 'N/A'}...")
+    print(f"\n{'=' * 40}")
+    print(f"Results: {json.dumps(result.summary(), indent=2)}")
+    print(f"Commits: {commit_count[0]}")
 
 
 if __name__ == "__main__":
