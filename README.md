@@ -1,5 +1,5 @@
-﻿# Amazon Product Scraper
-> **Portfolio context:** Extracted from founder-led production systems — multi-marketplace inventory, orders, and warehouse execution. **[Full portfolio](https://github.com/AspiranteD)** · [aspiranted.github.io](https://aspiranted.github.io)
+# Amazon Product Scraper
+> **Portfolio context:** Extracted from founder-led production systems � multi-marketplace inventory, orders, and warehouse execution. **[Full portfolio](https://github.com/AspiranteD/AspiranteD)** � [aspiranted.github.io](https://aspiranted.github.io)
 
 Production-grade web scraper for Amazon ES (amazon.es) product pages. Designed for high-volume batch scraping of thousands of ASINs with built-in resilience, priority queuing, idempotent writes, and anti-rate-limiting.
 
@@ -7,18 +7,18 @@ Production-grade web scraper for Amazon ES (amazon.es) product pages. Designed f
 
 ```
 src/
-├── scraper/
-│   ├── amazon_scraper.py     # Core scraper: title, images, price, features extraction
-│   └── user_agents.py        # UA rotation with usage tracking and hot-reload
-├── queue/
-│   └── scrape_queue.py       # Priority queue with real field names (lpn, asin, etc.)
-├── processor/
-│   └── batch_processor.py    # Orchestrates batch scraping with idempotent writes
-├── cli/
-│   └── scrape_batch.py       # CLI entry point with full argument parsing
-└── examples/
-    ├── scrape_single.py      # Single ASIN scrape demo
-    └── batch_scrape.py       # Full pipeline demo with queue + processor
++-- scraper/
+�   +-- amazon_scraper.py     # Core scraper: title, images, price, features extraction
+�   +-- user_agents.py        # UA rotation with usage tracking and hot-reload
++-- queue/
+�   +-- scrape_queue.py       # Priority queue with real field names (lpn, asin, etc.)
++-- processor/
+�   +-- batch_processor.py    # Orchestrates batch scraping with idempotent writes
++-- cli/
+�   +-- scrape_batch.py       # CLI entry point with full argument parsing
++-- examples/
+    +-- scrape_single.py      # Single ASIN scrape demo
+    +-- batch_scrape.py       # Full pipeline demo with queue + processor
 ```
 
 ## Key Technical Features
@@ -31,7 +31,7 @@ Primary extraction uses regex to find `"hiRes":"<url>"` patterns in the raw page
 
 ### Priority Queue System
 `ScrapeQueue` implements production-level prioritization using real database field names:
-- **Sort**: `(scraping_attempts ASC, last_scraped_at ASC NULLS FIRST)` — fresh items first, then oldest retries
+- **Sort**: `(scraping_attempts ASC, last_scraped_at ASC NULLS FIRST)` � fresh items first, then oldest retries
 - **Filters**: by `available` status, `batch_id` (truckload codes), `price_only` mode, `max_attempts` threshold, `skip_attempt_limit`
 - **Dead marking**: items with `attempts=99` are permanently excluded (confirmed 404s)
 - **Field tracking**: `has_description`, `has_images`, `has_features`, `has_price`, `is_complete`, `missing_fields`
@@ -47,12 +47,12 @@ This prevents accidental overwrites of manually corrected data.
 
 ### Intelligent Retry Logic
 - **200 with price**: full success, no attempt increment
-- **200 without price**: data saved but **attempts incremented** — item retried with lower priority
+- **200 without price**: data saved but **attempts incremented** � item retried with lower priority
 - **404**: permanently marked with `attempts=99`, never retried
 - **Network error**: attempts incremented (or not, via `mark_failures` flag)
 
 ### `--no-mark-failures` Mode
-Production flag that prevents incrementing `scraping_attempts` on errors. Useful for test runs or when scraping infrastructure issues are expected — items stay at original priority for the next real run.
+Production flag that prevents incrementing `scraping_attempts` on errors. Useful for test runs or when scraping infrastructure issues are expected � items stay at original priority for the next real run.
 
 ### User Agent Rotation
 - 6 built-in real Chrome/Firefox/Safari user agents
@@ -132,7 +132,7 @@ python -m pytest tests/ -v
 |----------|-----------|
 | Integer prices (no decimals) | Amazon ES products in this domain are whole-euro; simplifies downstream |
 | `attempts=99` for 404 | Convention: distinguishes confirmed-gone products from retry-eligible failures |
-| Regex for hiRes images | More reliable than DOM — Amazon embeds gallery JSON in script tags |
+| Regex for hiRes images | More reliable than DOM � Amazon embeds gallery JSON in script tags |
 | 8 image limit | Target marketplace (Wallapop) listing maximum |
 | Idempotent writes | Never overwrite manually corrected data in production |
 | `mark_failures` flag | Test runs shouldn't penalize items for infrastructure issues |
